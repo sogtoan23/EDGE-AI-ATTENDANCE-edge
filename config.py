@@ -1,8 +1,12 @@
 import os
 
 # ================= CẤU HÌNH SERVER RENDER =================
-SERVER_HTTP_URL = "https://face-attendance-server-j1bf.onrender.com/"
+SERVER_HTTP_URL = "https://face-attendance-server-j1bf.onrender.com"
 SERVER_WS_URL = "wss://face-attendance-server-j1bf.onrender.com/ws"
+
+# ================= CẤU HÌNH STREAMING CAMERA QUA TRÌNH DUYỆT =================
+STREAM_HOST = "0.0.0.0"        # Lắng nghe trên mọi card mạng (Wi-Fi / LAN)
+STREAM_PORT = 8080             # Truy cập http://192.168.137.51:8080 trên Chrome
 
 # ================= NGƯỠNG XỬ LÝ AI =================
 DET_CONF_THRESHOLD = 0.55      # Ngưỡng phát hiện khuôn mặt (SCRFD)
@@ -13,7 +17,7 @@ MATCH_THRESHOLD = 0.50         # Ngưỡng nhận diện danh tính (Cosine Simi
 MAX_FACES_PER_FRAME = 3        # Top-K: Tối đa 3 khuôn mặt gần cửa nhất mỗi frame
 ROI_X_MARGIN_RATIO = 0.12      # Cắt bỏ 12% rìa trái & phải (loại người đi ngoài hành lang)
 ROI_Y_MARGIN_RATIO = 0.05      # Cắt bỏ 5% mép trên/dưới
-MIN_FACE_AREA_RATIO = 0.008    # Diện tích mặt tối thiểu >= 0.8% khung hình (tương thích cả cam VGA/HD)
+MIN_FACE_AREA_RATIO = 0.008    # Diện tích mặt tối thiểu >= 0.8% khung hình
 
 TRACK_IOU_THRESHOLD = 0.35     # Ngưỡng IoU ghép cặp khuôn mặt giữa 2 frame liên tiếp
 TRACK_MAX_AGE = 15             # Số frame tối đa giữ Track_ID khi mất dấu tạm thời
@@ -21,8 +25,8 @@ CONSISTENT_FRAMES = 2          # Số frame xác nhận liên tiếp trước kh
 
 # ================= CHỐNG SPAM SERVER & MỞ KHÓA CA TIẾP THEO =================
 IN_FLIGHT_LOCK_SECONDS = 15    # Khóa tạm 15s ngay lúc đang gửi request lên Server
-SESSION_COOLDOWN_SECONDS = 900 # Khóa 15 phút (900s) sau khi điểm danh thành công ca hiện tại -> tự mở cho ca sau
-IGNORED_COOLDOWN_SECONDS = 60  # Khóa 60s nếu quét ngoài giờ/chưa tới ca để tránh spam khi đứng chờ
+SESSION_COOLDOWN_SECONDS = 900 # Khóa 15 phút (900s) sau khi điểm danh thành công ca hiện tại
+IGNORED_COOLDOWN_SECONDS = 60  # Khóa 60s nếu quét ngoài giờ/chưa tới ca
 
 # ================= ĐƯỜNG DẪN LƯU TRỮ CỤC BỘ =================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))

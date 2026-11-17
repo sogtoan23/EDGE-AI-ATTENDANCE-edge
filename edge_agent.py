@@ -7,6 +7,7 @@ import base64
 import threading
 from collections import deque
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import cv2
 import numpy as np
@@ -17,6 +18,8 @@ from PIL import Image, ImageDraw, ImageFont
 from config import (
     SERVER_HTTP_URL,
     SERVER_WS_URL,
+    STREAM_HOST,
+    STREAM_PORT,
     LIVENESS_THRESHOLD,
     MATCH_THRESHOLD,
     MAX_FACES_PER_FRAME,
@@ -32,6 +35,106 @@ from config import (
     PUNCH_CACHE_FILE,
 )
 from ai_pipeline import EdgeAIPipeline
+
+
+# ======================================================================
+# 0. MÁY CHỦ PHÁT LUỒNG VIDEO MJPEG QUA TRÌNH DUYỆT (HEADLESS STREAMING)
+# ======================================================================
+class MJPEGStreamServer:
+    def __init__(self, host="0.0.0.0", port=8080):
+        self.host = host
+        self.port = port
+        self._frame_lock = threading.Lock()
+        self._latest_jpeg = None
+        self._server = None
+        self._running = False
+
+    def update_frame(self, bgr_frame):
+        """Nén khung hình BGR sang JPEG chất lượng 75% để truyền mượt qua mạng."""
+        ret, buf = cv2.imencode(".jpg", bgr_frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+        if ret:
+            with self._frame_lock:
+                self._latest_jpeg = buf.tobytes()
+
+    def get_latest_jpeg(self):
+        with self._frame_lock:
+            return self._latest_jpeg
+
+    def start(self):
+        stream_ref = self
+
+        class StreamHandler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass  # Tắt log HTTP rác trên Terminal
+
+            def do_GET(self):
+                if self.path == "/":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.end_headers()
+                    html = """
+                    <!DOCTYPE html>
+                    <html>
+                    <head>
+                        <title>Edge AI Camera Live Stream</title>
+                        <meta name="viewport" content="width=device-width, initial-scale=1">
+                        <style>
+                            body { margin: 0; background: #0f172a; color: #f8fafc; font-family: sans-serif;
+                                   display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; }
+                            .box { border: 2px solid #38bdf8; border-radius: 10px; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+                            img { display: block; max-width: 96vw; max-height: 85vh; }
+                            .bar { padding: 8px 16px; background: #1e293b; font-size: 14px; display: flex; justify-content: space-between; }
+                            .dot { color: #4ade80; font-weight: bold; }
+                        </style>
+                    </head>
+                    <body>
+                        <div class="box">
+                            <div class="bar">
+                                <span>📡 EDGE AI CAMERA LIVE (HEADLESS MJPEG)</span>
+                                <span class="dot">● LIVE</span>
+                            </div>
+                            <img src="/stream.mjpg" alt="Live Stream" />
+                        </div>
+                    </body>
+                    </html>
+                    """
+                    self.wfile.write(html.encode("utf-8"))
+
+                elif self.path == "/stream.mjpg":
+                    self.send_response(200)
+                    self.send_header("Age", "0")
+                    self.send_header("Cache-Control", "no-cache, private")
+                    self.send_header("Pragma", "no-cache")
+                    self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=FRAME")
+                    self.end_headers()
+                    try:
+                        while stream_ref._running:
+                            jpg = stream_ref.get_latest_jpeg()
+                            if jpg is not None:
+                                self.wfile.write(b"--FRAME\r\n")
+                                self.send_header("Content-Type", "image/jpeg")
+                                self.send_header("Content-Length", str(len(jpg)))
+                                self.end_headers()
+                                self.wfile.write(jpg)
+                                self.wfile.write(b"\r\n")
+                            time.sleep(0.03)  # ~30 FPS tối đa
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+                else:
+                    self.send_error(404)
+
+        self._running = True
+        self._server = ThreadingHTTPServer((self.host, self.port), StreamHandler)
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+
+    def stop(self):
+        self._running = False
+        if self._server:
+            try:
+                self._server.shutdown()
+                self._server.server_close()
+            except Exception:
+                pass
 
 
 # ======================================================================
@@ -58,16 +161,23 @@ class WebcamManager:
             json.dump(self.webcams, f, ensure_ascii=False, indent=2)
 
     @staticmethod
-    def scan_physical_cameras(max_ports=6) -> list:
-        """Quét tất cả cổng webcam vật lý (dùng DirectShow trên Windows cho cam USB)."""
+    def scan_physical_cameras(max_ports=8) -> list:
+        """Quét tất cả cổng webcam vật lý (V4L2 trên Linux, DirectShow trên Windows)."""
         found = []
-        backend = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY
+        backend = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_V4L2
         for idx in range(max_ports):
+            if os.name != "nt" and not os.path.exists(f"/dev/video{idx}"):
+                continue
             cap = cv2.VideoCapture(idx, backend)
             if cap.isOpened():
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
                 ret, frame = False, None
-                for _ in range(3):
+                for _ in range(8):
                     ret, frame = cap.read()
+                    if ret and frame is not None:
+                        break
+                    time.sleep(0.05)
                 if ret and frame is not None:
                     h, w = frame.shape[:2]
                     found.append({"port": idx, "resolution": f"{w}x{h}"})
@@ -76,7 +186,6 @@ class WebcamManager:
 
     @staticmethod
     def verify_token_with_server(token: str) -> bool:
-        """Kiểm tra mã X-Device-Token với Server Render/Local."""
         print("   ⏳ Đang xác thực X-Device-Token với Server...")
         try:
             res = requests.get(
@@ -113,7 +222,7 @@ class WebcamManager:
                     break
                 print("   ❌ Định dạng không hợp lệ. Vui lòng nhập số cổng hoặc link rtsp://")
 
-        room_name = input("👉 Nhập tên Phòng học gắn kèm (VD: F404, P302): ").strip().upper() or "CHƯA_GÁN_PHÒNG"
+        room_name = input("👉 Nhập tên Phòng học gắn kèm (VD: F101, P302): ").strip().upper() or "CHƯA_GÁN_PHÒNG"
         device_name = input("👉 Nhập tên gợi nhớ cho Webcam (VD: Cam Cửa Chính): ").strip() or f"Camera {room_name}"
 
         while True:
@@ -208,7 +317,6 @@ class WebcamManager:
         print("=" * 82)
 
     def check_and_prompt_new_webcams(self):
-        """Quét phần cứng và hỏi thêm ngay nếu phát hiện webcam mới cắm vào."""
         print("\n🔍 Đang quét các webcam kết nối trên thiết bị...")
         physical_cams = self.scan_physical_cameras()
         saved_ports = {c["camera_source"] for c in self.webcams if isinstance(c["camera_source"], int)}
@@ -231,7 +339,7 @@ class WebcamManager:
         while True:
             self.print_webcam_table()
             print("📌 BẢNG ĐIỀU KHIỂN QUẢN LÝ WEBCAM:")
-            print("   [1] ▶️  Chọn Webcam và BẮT ĐẦU ĐIỂM DANH")
+            print("   [1] ▶️  Chọn Webcam và BẮT ĐẦU ĐIỂM DANH (Headless + HTTP Stream)")
             print("   [2] ➕  Thêm Webcam mới (USB / RTSP)")
             print("   [3] ✏️  Chỉnh sửa thông tin / Đổi mã X-Device-Token")
             print("   [4] 🗑️  Xóa Webcam khỏi danh sách")
@@ -348,7 +456,7 @@ class MultiFaceTracker:
 
 
 # ======================================================================
-# 3. LÕI XỬ LÝ ĐIỂM DANH TẠI BIÊN (CHỐNG SPAM + TỰ MỞ KHÓA CA TIẾP THEO)
+# 3. LÕI XỬ LÝ ĐIỂM DANH TẠI BIÊN (HEADLESS + MJPEG STREAMING + ANTI-SPAM)
 # ======================================================================
 class EdgeAttendanceAgent:
     def __init__(self, device_cfg: dict):
@@ -359,6 +467,7 @@ class EdgeAttendanceAgent:
 
         self.ai = EdgeAIPipeline()
         self.tracker = MultiFaceTracker(iou_threshold=TRACK_IOU_THRESHOLD, max_age=TRACK_MAX_AGE)
+        self.streamer = MJPEGStreamServer(host=STREAM_HOST, port=STREAM_PORT)
 
         self.lock = threading.Lock()
         self.student_ids = []
@@ -370,19 +479,34 @@ class EdgeAttendanceAgent:
             "Content-Type": "application/json",
         }
 
-        # Bộ nhớ chống spam theo từng sinh viên & ca học:
-        # Key: f"{room_name}:{student_id}"
-        # Value: {"cooldown_until": float, "status": str, "full_name": str, "result_status": str, "schedule_id": int|None}
         self.punched_records = {}
         self.recent_checkins = deque(maxlen=4)
+
+        # Nạp sẵn Font 1 lần duy nhất để tối ưu tốc độ vẽ khung hình
+        self._init_fonts()
 
         self._load_punch_cache()
         self._load_local_cache()
         self.sync_vectors_from_server()
 
-    # ------------------------------------------------------------------
-    # QUẢN LÝ BỘ NHỚ CHỐNG SPAM (SESSION COOLDOWN CACHE)
-    # ------------------------------------------------------------------
+    def _init_fonts(self):
+        font_candidates = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "arial.ttf",
+        ]
+        self.font = None
+        for fp in font_candidates:
+            if os.path.exists(fp):
+                try:
+                    self.font = ImageFont.truetype(fp, 17)
+                    self.font_small = ImageFont.truetype(fp, 13)
+                    break
+                except Exception:
+                    pass
+        if self.font is None:
+            self.font = ImageFont.load_default()
+            self.font_small = self.font
+
     def _load_punch_cache(self):
         if not os.path.exists(PUNCH_CACHE_FILE):
             return
@@ -402,7 +526,6 @@ class EdgeAttendanceAgent:
             self.punched_records = {}
 
     def _save_punch_cache(self):
-        # Lưu ý: Hàm này được gọi bên trong self.lock hoặc sau khi lấy bản sao an toàn
         now = time.time()
         clean_data = {
             k: v for k, v in self.punched_records.items() if v.get("cooldown_until", 0) > now
@@ -414,11 +537,6 @@ class EdgeAttendanceAgent:
             pass
 
     def _try_acquire_punch_slot(self, student_id: str) -> tuple[bool, dict | None]:
-        """
-        Kiểm tra xem sinh viên này có được phép gửi punch lên Server lúc này không.
-        - Trả về (True, None) và KHÓA NGAY lập tức nếu hợp lệ (chống gửi trùng đa luồng).
-        - Trả về (False, record_dict) nếu đang trong thời gian khóa chống spam của ca hiện tại.
-        """
         key = f"{self.room_name}:{student_id}"
         now = time.time()
         with self.lock:
@@ -426,7 +544,6 @@ class EdgeAttendanceAgent:
             if rec and now < rec.get("cooldown_until", 0):
                 return False, dict(rec)
 
-            # Cấp quyền gửi và khóa tạm thời ngay lập tức trong lúc chờ HTTP response
             self.punched_records[key] = {
                 "cooldown_until": now + IN_FLIGHT_LOCK_SECONDS,
                 "status": "in_flight",
@@ -436,9 +553,6 @@ class EdgeAttendanceAgent:
             }
             return True, None
 
-    # ------------------------------------------------------------------
-    # ĐỒNG BỘ VECTOR & QUẢN LÝ LOCAL CACHE
-    # ------------------------------------------------------------------
     def _rebuild_matrix(self, data_list):
         with self.lock:
             ids = []
@@ -539,9 +653,6 @@ class EdgeAttendanceAgent:
                 return self.student_ids[best_idx], best_score
         return None, best_score
 
-    # ------------------------------------------------------------------
-    # HÀNG ĐỢI OFFLINE & GỬI ĐIỂM DANH LÊN SERVER
-    # ------------------------------------------------------------------
     def _enqueue_offline(self, payload: dict):
         with self.lock:
             queue = []
@@ -630,7 +741,6 @@ class EdgeAttendanceAgent:
 
                         with self.lock:
                             self.resolved_names[student_id] = full_name
-                            # Khóa chống spam trong 15 phút cho ca học hiện tại; hết 15p tự mở cho ca sau
                             self.punched_records[key] = {
                                 "cooldown_until": time.time() + SESSION_COOLDOWN_SECONDS,
                                 "status": "success",
@@ -645,8 +755,7 @@ class EdgeAttendanceAgent:
 
                         print(
                             f"[{self.room_name} | SUCCESS] {student_id} - {full_name} "
-                            f"| Ca ID: {schedule_id} ({subject_name}) | {result_status} "
-                            f"(Khóa chống spam {SESSION_COOLDOWN_SECONDS // 60} phút)"
+                            f"| Ca ID: {schedule_id} ({subject_name}) | {result_status}"
                         )
 
                     elif resp_status == "ignored":
@@ -696,9 +805,6 @@ class EdgeAttendanceAgent:
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    # ------------------------------------------------------------------
-    # WEBSOCKET LẮNG NGHE ĐỒNG BỘ REALTIME TỪ SERVER
-    # ------------------------------------------------------------------
     def start_ws_listener(self):
         self._ws_running = True
 
@@ -744,162 +850,145 @@ class EdgeAttendanceAgent:
             except Exception:
                 pass
 
-    # ------------------------------------------------------------------
-    # VẼ KHUNG ROI ZONE, TRACK_ID & BẢNG PHẢN HỒI TẠI CỬA LỚP
-    # ------------------------------------------------------------------
     def _draw_overlay(self, frame, tracks_to_draw, roi_bounds):
         img_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         draw = ImageDraw.Draw(img_pil)
-        try:
-            font = ImageFont.truetype("arial.ttf", 19)
-            font_small = ImageFont.truetype("arial.ttf", 15)
-        except Exception:
-            font = ImageFont.load_default()
-            font_small = font
 
         h, w, _ = frame.shape
         rx1, ry1, rx2, ry2 = roi_bounds
 
         draw.rectangle([rx1, ry1, rx2, ry2], outline=(56, 189, 248), width=2)
-        draw.text((rx1 + 8, ry1 + 6), "VÙNG QUÉT ROI (0.5m - 1.5m)", font=font_small, fill=(56, 189, 248))
+        draw.text((rx1 + 8, ry1 + 6), "VÙNG QUÉT ROI (0.5m - 1.5m)", font=self.font_small, fill=(56, 189, 248))
 
-        draw.rectangle([0, 0, w, 36], fill=(15, 23, 42))
-        header_txt = (
-            f"PHÒNG: {self.room_name} | {self.device_name} | "
-            f"Dữ liệu: {len(self.student_ids)} SV | Phím: [M] Quản lý Cam  [S] Đồng bộ  [Q] Thoát"
-        )
-        draw.text((15, 8), header_txt, font=font_small, fill=(248, 250, 252))
+        draw.rectangle([0, 0, w, 32], fill=(15, 23, 42))
+        header_txt = f"PHÒNG: {self.room_name} | {self.device_name} | Dữ liệu: {len(self.student_ids)} SV"
+        draw.text((12, 8), header_txt, font=self.font_small, fill=(248, 250, 252))
 
         for track in tracks_to_draw:
             x1, y1, x2, y2 = track.bbox.astype(int)
             if track.is_spoof:
                 color = (220, 38, 38)
-                label = f"[ID#{track.track_id}] CẢNH BÁO GIẢ MẠO ({track.spoof_score:.2f})"
+                label = f"[ID#{track.track_id}] GIẢ MẠO ({track.spoof_score:.2f})"
             elif track.verified:
                 color = (22, 163, 74)
                 with self.lock:
                     name_show = track.display_name or self.resolved_names.get(track.student_id, track.student_id)
                 st_suffix = f" - {track.last_status_text}" if track.last_status_text else ""
-                label = f"✅ [ID#{track.track_id}] {name_show}{st_suffix}"
+                label = f"✔ [ID#{track.track_id}] {name_show}{st_suffix}"
             elif track.candidate_id:
                 color = (234, 179, 8)
-                label = f"⏳ [ID#{track.track_id}] Đang xác thực {track.candidate_id}..."
+                label = f"⏳ [ID#{track.track_id}] {track.candidate_id}..."
             else:
                 color = (37, 99, 235)
                 label = f"[ID#{track.track_id}] Người lạ ({track.similarity:.2f})"
 
             draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
-            text_w = max(180, len(label) * 10 + 16)
-            draw.rectangle([x1, max(36, y1 - 28), x1 + text_w, max(36, y1)], fill=color)
-            draw.text((x1 + 6, max(38, y1 - 25)), label, font=font, fill=(255, 255, 255))
+            text_w = max(160, len(label) * 9 + 14)
+            draw.rectangle([x1, max(32, y1 - 24), x1 + text_w, max(32, y1)], fill=color)
+            draw.text((x1 + 5, max(34, y1 - 22)), label, font=self.font_small, fill=(255, 255, 255))
 
         with self.lock:
             recent_snapshot = list(self.recent_checkins)
 
         if recent_snapshot:
-            overlay_h = 72 + len(recent_snapshot) * 23
-            draw.rectangle([10, 42, 540, overlay_h], fill=(15, 23, 42))
-            draw.text((18, 46), "NHẬT KÝ CỬA LỚP GẦN NHẤT:", font=font_small, fill=(56, 189, 248))
+            overlay_h = 62 + len(recent_snapshot) * 20
+            draw.rectangle([8, 36, 480, overlay_h], fill=(15, 23, 42))
+            draw.text((14, 40), "NHẬT KÝ CỬA LỚP GẦN NHẤT:", font=self.font_small, fill=(56, 189, 248))
             for idx, line in enumerate(recent_snapshot):
-                draw.text((18, 68 + idx * 22), line, font=font_small, fill=(74, 222, 128))
+                draw.text((14, 58 + idx * 19), line, font=self.font_small, fill=(74, 222, 128))
 
         return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
     # ------------------------------------------------------------------
-    # VÒNG LẶP CAMERA CHÍNH: ROI -> TOP-K -> TRACKING -> ANTI-SPAM PUNCH
+    # VÒNG LẶP HEADLESS: KHÔNG CẦN MÀN HÌNH X11, PHÁT LUỒNG QUA HTTP 8080
     # ------------------------------------------------------------------
     def run(self) -> str:
         self.start_ws_listener()
-        backend = cv2.CAP_DSHOW if os.name == "nt" and isinstance(self.camera_source, int) else cv2.CAP_ANY
+        self.streamer.start()
+
+        backend = cv2.CAP_DSHOW if os.name == "nt" and isinstance(self.camera_source, int) else cv2.CAP_V4L2
         cap = cv2.VideoCapture(self.camera_source, backend)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
         if not cap.isOpened():
             print(f"❌ Không thể mở nguồn camera [{self.camera_source}]. Quay lại trình quản lý Webcam...")
+            self.streamer.stop()
             self.stop_ws_listener()
             return "MENU"
 
-        print(f"\n🚀 [{self.room_name} - {self.device_name}] Đang chạy điểm danh!")
-        print("   👉 Phím tắt trên cửa sổ camera: [M] Quản lý Webcam | [S] Đồng bộ vector | [Q] Thoát")
+        print(f"\n🚀 [{self.room_name} - {self.device_name}] Đang chạy chế độ HEADLESS!")
+        print(f"🌐 Mở trình duyệt Chrome trên laptop Asus truy cập: http://192.168.137.51:{STREAM_PORT}")
+        print("👉 Nhấn tổ hợp phím Ctrl + C trên Terminal để dừng camera và quay lại Menu quản lý.")
 
-        next_action = "EXIT"
-
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                time.sleep(0.1)
-                continue
-
-            roi_bounds = self.ai.get_roi_bounds(frame.shape)
-            top_k_detections = self.ai.detect_faces_in_roi(frame, max_faces=MAX_FACES_PER_FRAME)
-            tracked_pairs = self.tracker.update(top_k_detections)
-            active_tracks = []
-
-            for track, det in tracked_pairs:
-                active_tracks.append(track)
-
-                # TẦNG 1 CHỐNG SPAM: Track_ID này đã xác thực rồi -> Bỏ qua hoàn toàn AI & HTTP
-                if track.verified:
+        try:
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    time.sleep(0.05)
                     continue
 
-                liveness = self.ai.check_liveness(frame, det["bbox"])
-                if liveness < LIVENESS_THRESHOLD:
-                    track.is_spoof = True
-                    track.spoof_score = liveness
-                    track.hit_count = 0
-                    continue
+                roi_bounds = self.ai.get_roi_bounds(frame.shape)
+                top_k_detections = self.ai.detect_faces_in_roi(frame, max_faces=MAX_FACES_PER_FRAME)
+                tracked_pairs = self.tracker.update(top_k_detections)
+                active_tracks = []
 
-                track.is_spoof = False
+                for track, det in tracked_pairs:
+                    active_tracks.append(track)
 
-                aligned = self.ai.align_face(frame, det["kps"])
-                emb = self.ai.extract_embedding(aligned)
+                    if track.verified:
+                        continue
 
-                sid, score = self.match_embedding(emb)
-                track.similarity = score
+                    liveness = self.ai.check_liveness(frame, det["bbox"])
+                    if liveness < LIVENESS_THRESHOLD:
+                        track.is_spoof = True
+                        track.spoof_score = liveness
+                        track.hit_count = 0
+                        continue
 
-                if sid:
-                    if track.candidate_id == sid:
-                        track.hit_count += 1
-                    else:
-                        track.candidate_id = sid
-                        track.hit_count = 1
+                    track.is_spoof = False
 
-                    if track.hit_count >= CONSISTENT_FRAMES:
-                        track.verified = True
-                        track.student_id = sid
+                    aligned = self.ai.align_face(frame, det["kps"])
+                    emb = self.ai.extract_embedding(aligned)
 
-                        # TẦNG 2 & 3 CHỐNG SPAM: Kiểm tra & khóa trước khi gửi lên Server
-                        can_send, existing_rec = self._try_acquire_punch_slot(sid)
-                        if can_send:
-                            with self.lock:
-                                track.display_name = self.resolved_names.get(sid, sid)
-                            self.send_punch_async(track, frame.copy())
+                    sid, score = self.match_embedding(emb)
+                    track.similarity = score
+
+                    if sid:
+                        if track.candidate_id == sid:
+                            track.hit_count += 1
                         else:
-                            # Sinh viên này đã được điểm danh trong ca hiện tại -> Hiển thị luôn trạng thái đã lưu, KHÔNG spam Server
-                            track.display_name = existing_rec.get("full_name", sid)
-                            track.last_status_text = existing_rec.get("result_status", "Đã điểm danh")
-                else:
-                    track.candidate_id = None
-                    track.hit_count = 0
+                            track.candidate_id = sid
+                            track.hit_count = 1
 
-            display_frame = self._draw_overlay(frame, active_tracks, roi_bounds)
-            cv2.imshow(f"EDGE AI - {self.room_name} ({self.device_name})", display_frame)
+                        if track.hit_count >= CONSISTENT_FRAMES:
+                            track.verified = True
+                            track.student_id = sid
 
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
-                next_action = "EXIT"
-                break
-            elif key == ord("s"):
-                self.sync_vectors_from_server()
-            elif key == ord("m"):
-                next_action = "MENU"
-                break
+                            can_send, existing_rec = self._try_acquire_punch_slot(sid)
+                            if can_send:
+                                with self.lock:
+                                    track.display_name = self.resolved_names.get(sid, sid)
+                                self.send_punch_async(track, frame.copy())
+                            else:
+                                track.display_name = existing_rec.get("full_name", sid)
+                                track.last_status_text = existing_rec.get("result_status", "Đã điểm danh")
+                    else:
+                        track.candidate_id = None
+                        track.hit_count = 0
+
+                # Vẽ khung AI & cập nhật khung hình mới nhất lên HTTP Server (cổng 8080)
+                display_frame = self._draw_overlay(frame, active_tracks, roi_bounds)
+                self.streamer.update_frame(display_frame)
+
+        except KeyboardInterrupt:
+            print("\n⏹️ Đã nhận lệnh dừng (Ctrl + C). Đang giải phóng camera...")
 
         cap.release()
-        cv2.destroyAllWindows()
+        self.streamer.stop()
         self.stop_ws_listener()
-        return next_action
+        return "MENU"
 
 
 # ======================================================================
@@ -916,5 +1005,4 @@ if __name__ == "__main__":
         agent = EdgeAttendanceAgent(selected_cam)
         action = agent.run()
         if action != "MENU":
-            print("👋 Đã dừng hệ thống Edge AI.")
             break
