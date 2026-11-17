@@ -1,0 +1,8 @@
+﻿__pycache__/
+*.pyc
+webcams_registry.json
+device_config.json
+local_vectors_cache.json
+session_punch_cache.json
+offline_attendance_queue.json
+.vscode/

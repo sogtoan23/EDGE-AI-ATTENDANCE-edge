@@ -1,0 +1,11 @@
+# --- Xử lý hình ảnh & Giao diện hiển thị ---
+opencv-python>=4.9.0.80
+Pillow>=10.0.0
+
+# --- Suy luận AI ONNX & Tính toán ma trận ---
+onnxruntime>=1.17.0
+numpy>=1.26.0,<2.0.0
+
+# --- Kết nối HTTP & WebSocket Realtime với Server ---
+requests>=2.31.0
+websocket-client>=1.7.0
