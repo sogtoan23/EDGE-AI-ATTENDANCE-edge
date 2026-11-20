@@ -1,10 +1,12 @@
 import os
 os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
 
+import sys
 import json
 import time
 import base64
 import threading
+import subprocess
 from collections import deque
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -124,6 +126,7 @@ class MJPEGStreamServer:
                     self.send_error(404)
 
         self._running = True
+        ThreadingHTTPServer.allow_reuse_address = True
         self._server = ThreadingHTTPServer((self.host, self.port), StreamHandler)
         threading.Thread(target=self._server.serve_forever, daemon=True).start()
 
@@ -138,7 +141,7 @@ class MJPEGStreamServer:
 
 
 # ======================================================================
-# 1. BỘ QUẢN LÝ DANH SÁCH WEBCAM (TỰ QUÉT MỚI, THÊM, SỬA TOKEN, XÓA)
+# 1. BỘ QUẢN LÝ DANH SÁCH WEBCAM (CHỈ MỞ KHI DÙNG --add HOẶC --menu)
 # ======================================================================
 class WebcamManager:
     def __init__(self, registry_path=WEBCAM_REGISTRY_FILE):
@@ -456,7 +459,7 @@ class MultiFaceTracker:
 
 
 # ======================================================================
-# 3. LÕI XỬ LÝ ĐIỂM DANH TẠI BIÊN (HEADLESS + MJPEG STREAMING + ANTI-SPAM)
+# 3. LÕI XỬ LÝ ĐIỂM DANH TẠI BIÊN (HEADLESS + MJPEG + OFFLINE SYNC)
 # ======================================================================
 class EdgeAttendanceAgent:
     def __init__(self, device_cfg: dict):
@@ -481,6 +484,9 @@ class EdgeAttendanceAgent:
 
         self.punched_records = {}
         self.recent_checkins = deque(maxlen=4)
+
+        self._ws_running = False
+        self._sync_running = False
 
         # Nạp sẵn Font 1 lần duy nhất để tối ưu tốc độ vẽ khung hình
         self._init_fonts()
@@ -701,6 +707,21 @@ class EdgeAttendanceAgent:
         if len(remaining) < len(queue):
             print(f"[OFFLINE-SYNC] Đã đồng bộ bù {len(queue) - len(remaining)} bản ghi lên Server.")
 
+    def start_offline_sync_worker(self):
+        """Tiến trình nền kiểm tra mỗi 15s: tự đẩy dữ liệu lưu tạm khi có mạng trở lại."""
+        self._sync_running = True
+
+        def _sync_loop():
+            while self._sync_running:
+                try:
+                    if os.path.exists(OFFLINE_QUEUE_FILE):
+                        self.flush_offline_queue()
+                except Exception:
+                    pass
+                time.sleep(15)
+
+        threading.Thread(target=_sync_loop, daemon=True).start()
+
     def send_punch_async(self, track: FaceTrack, frame_snapshot):
         student_id = track.student_id
         similarity = track.similarity
@@ -900,27 +921,41 @@ class EdgeAttendanceAgent:
         return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
     # ------------------------------------------------------------------
-    # VÒNG LẶP HEADLESS: KHÔNG CẦN MÀN HÌNH X11, PHÁT LUỒNG QUA HTTP 8080
+    # VÒNG LẶP HEADLESS: TỰ DÒ CỔNG USB & PHÁT LUỒNG QUA HTTP 8080
     # ------------------------------------------------------------------
     def run(self) -> str:
         self.start_ws_listener()
+        self.start_offline_sync_worker()
         self.streamer.start()
 
         backend = cv2.CAP_DSHOW if os.name == "nt" and isinstance(self.camera_source, int) else cv2.CAP_V4L2
         cap = cv2.VideoCapture(self.camera_source, backend)
+
+        # Tự động dò lại cổng USB nếu Debian đổi số /dev/video* (VD: từ 0 sang 2)
+        if not cap.isOpened() and isinstance(self.camera_source, int):
+            print(f"⚠️ Cổng [{self.camera_source}] không phản hồi, đang tự động tìm cổng USB thay thế...")
+            cams = WebcamManager.scan_physical_cameras()
+            if cams:
+                new_port = cams[0]["port"]
+                print(f"✅ Đã tự động chuyển sang cổng USB [{new_port}]!")
+                cap = cv2.VideoCapture(new_port, backend)
+
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
         if not cap.isOpened():
             print(f"❌ Không thể mở nguồn camera [{self.camera_source}]. Quay lại trình quản lý Webcam...")
+            self._sync_running = False
             self.streamer.stop()
             self.stop_ws_listener()
             return "MENU"
 
-        print(f"\n🚀 [{self.room_name} - {self.device_name}] Đang chạy chế độ HEADLESS!")
-        print(f"🌐 Mở trình duyệt Chrome trên laptop Asus truy cập: http://192.168.137.51:{STREAM_PORT}")
-        print("👉 Nhấn tổ hợp phím Ctrl + C trên Terminal để dừng camera và quay lại Menu quản lý.")
+        ips = subprocess.getoutput("hostname -I").strip().split() if os.name != "nt" else ["127.0.0.1"]
+        print(f"\n🚀 [{self.room_name} - {self.device_name}] Đang chạy chế độ HEADLESS ĐỘC LẬP!")
+        for ip in (ips or ["127.0.0.1"]):
+            print(f"🌐 Mở trình duyệt trên máy khác truy cập: http://{ip}:{STREAM_PORT}")
+        print("👉 Nhấn tổ hợp phím Ctrl + C trên Terminal để dừng camera.")
 
         try:
             while cap.isOpened():
@@ -986,23 +1021,57 @@ class EdgeAttendanceAgent:
             print("\n⏹️ Đã nhận lệnh dừng (Ctrl + C). Đang giải phóng camera...")
 
         cap.release()
+        self._sync_running = False
         self.streamer.stop()
         self.stop_ws_listener()
         return "MENU"
 
 
 # ======================================================================
-# ĐIỂM KHỞI CHẠY CHÍNH
+# ĐIỂM KHỞI CHẠY CHÍNH (MẶC ĐỊNH TỰ CHẠY NGAY - CHỈ MỞ MENU KHI YÊU CẦU)
 # ======================================================================
 if __name__ == "__main__":
     manager = WebcamManager()
-    while True:
-        selected_cam = manager.open_manager_menu()
-        if selected_cam is None:
-            print("👋 Đã thoát hệ thống Edge AI.")
-            break
 
-        agent = EdgeAttendanceAgent(selected_cam)
-        action = agent.run()
-        if action != "MENU":
-            break
+    # 1. Chỉ mở giao diện thêm camera khi chủ động truyền --add
+    if "--add" in sys.argv:
+        manager.check_and_prompt_new_webcams()
+        if not manager.webcams:
+            manager.add_webcam_interactive()
+        selected_cam = manager.webcams[-1]
+        print(f"🚀 Khởi chạy ngay webcam vừa cấu hình: {selected_cam['device_name']} ({selected_cam['room_name']})")
+        EdgeAttendanceAgent(selected_cam).run()
+
+    # 2. Mở đầy đủ bảng điều khiển quản lý khi truyền --menu
+    elif "--menu" in sys.argv:
+        while True:
+            selected_cam = manager.open_manager_menu()
+            if selected_cam is None:
+                print("👋 Đã thoát hệ thống Edge AI.")
+                break
+            action = EdgeAttendanceAgent(selected_cam).run()
+            if action != "MENU":
+                break
+
+    # 3. MẶC ĐỊNH (python edge_agent.py hoặc chạy ngầm): LUÔN TỰ CHẠY NGAY KHÔNG HỎI
+    else:
+        if not manager.webcams:
+            print("⚠️ Chưa có cấu hình camera lần đầu. Đang quét thiết bị để thiết lập 1 lần duy nhất...")
+            manager.check_and_prompt_new_webcams()
+            if not manager.webcams:
+                manager.add_webcam_interactive()
+            if not manager.webcams:
+                sys.exit(1)
+
+        selected_cam = manager.webcams[0]
+        if "--room" in sys.argv:
+            idx = sys.argv.index("--room")
+            if idx + 1 < len(sys.argv):
+                target_room = sys.argv[idx + 1].upper()
+                for cam in manager.webcams:
+                    if cam["room_name"].upper() == target_room:
+                        selected_cam = cam
+                        break
+
+        print(f"🤖 [AUTO-RUN] Tự động chạy điểm danh: {selected_cam['device_name']} - Phòng {selected_cam['room_name']}")
+        EdgeAttendanceAgent(selected_cam).run()

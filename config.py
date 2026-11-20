@@ -6,7 +6,7 @@ SERVER_WS_URL = "wss://face-attendance-server-j1bf.onrender.com/ws"
 
 # ================= CẤU HÌNH STREAMING CAMERA QUA TRÌNH DUYỆT =================
 STREAM_HOST = "0.0.0.0"        # Lắng nghe trên mọi card mạng (Wi-Fi / LAN)
-STREAM_PORT = 8080             # Truy cập http://192.168.137.51:8080 trên Chrome
+STREAM_PORT = 8080             # Truy cập http://<IP-Debian>:8080 trên trình duyệt
 
 # ================= NGƯỠNG XỬ LÝ AI =================
 DET_CONF_THRESHOLD = 0.55      # Ngưỡng phát hiện khuôn mặt (SCRFD)
